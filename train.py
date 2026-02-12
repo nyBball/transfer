@@ -1,6 +1,6 @@
 """
 Multi-GPU DDP Training for KV Cache Prediction v5
-Input: hidden_states.pt + kv_cache_reuse.pt → kv_cache_no_reuse.pt
+Input: hidden_states.pt + kv_cache_reuse.pt + stable_patches.json → kv_cache_no_reuse.pt
 Per-layer independent models for maximum accuracy.
 
 Usage: torchrun --nproc_per_node=8 train.py
@@ -58,9 +58,10 @@ def validate(model, val_loader, device):
         hidden_states = batch["hidden_states"].to(device, non_blocking=True)
         reuse_kv = batch["reuse_kv"].to(device, non_blocking=True)
         target_kv = batch["target_kv"].to(device, non_blocking=True)
+        stable_mask = batch["stable_mask"].to(device, non_blocking=True)
 
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-            output = model(hidden_states, reuse_kv, target_kv)
+            output = model(hidden_states, reuse_kv, stable_mask, target_kv)
             loss = output["loss"]
 
         total_loss += loss.item()
@@ -175,12 +176,13 @@ def train(config: TrainingConfig):
             hidden_states = batch["hidden_states"].to(device, non_blocking=True)
             reuse_kv = batch["reuse_kv"].to(device, non_blocking=True)
             target_kv = batch["target_kv"].to(device, non_blocking=True)
+            stable_mask = batch["stable_mask"].to(device, non_blocking=True)
 
             # Forward with AMP (bfloat16 autocast)
             optimizer.zero_grad(set_to_none=True)
 
             with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=config.use_amp):
-                output = model(hidden_states, reuse_kv, target_kv)
+                output = model(hidden_states, reuse_kv, stable_mask, target_kv)
                 loss = output["loss"]
 
             # Backward

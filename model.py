@@ -3,6 +3,7 @@ Model for KV Cache Prediction v5
 Key design:
   - Per-layer INDEPENDENT models (no weight sharing) for maximum accuracy
   - HiddenStateEncoder replaces PatchEncoder (CNN → Linear)
+  - stable_patches mask as input feature + masked loss
   - LayerNorm throughout + proper weight initialization
   - Residual learning: pred = reuse + delta
 """
@@ -15,14 +16,16 @@ from typing import Dict
 
 class HiddenStateEncoder(nn.Module):
     """
-    Encode hidden states (B, 256, 4096) -> (B, 256, embed_dim)
+    Encode hidden states (B, 256, 4096) + stable_mask (B, 256) -> (B, 256, embed_dim)
     Two-layer MLP with LayerNorm.
+    The stable_mask is concatenated as a 1-dim feature to each patch.
     """
 
     def __init__(self, input_dim: int = 4096, hidden_dim: int = 1024, embed_dim: int = 256):
         super().__init__()
+        # +1 for stable_mask flag
         self.encoder = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
+            nn.Linear(input_dim + 1, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.GELU(),
             nn.Linear(hidden_dim, embed_dim),
@@ -37,12 +40,16 @@ class HiddenStateEncoder(nn.Module):
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor, stable_mask: torch.Tensor) -> torch.Tensor:
         """
         hidden_states: (B, 256, 4096) float32
+        stable_mask:   (B, 256) bool
         returns: (B, 256, embed_dim)
         """
-        return self.encoder(hidden_states)
+        # Concat stable_mask as float feature: (B, 256, 1)
+        mask_feat = stable_mask.unsqueeze(-1).float()
+        x = torch.cat([hidden_states, mask_feat], dim=-1)  # (B, 256, 4097)
+        return self.encoder(x)
 
 
 class PerLayerKVPredictor(nn.Module):
@@ -183,15 +190,17 @@ class KVCacheModel(nn.Module):
         self,
         hidden_states: torch.Tensor,
         reuse_kv: torch.Tensor,
+        stable_mask: torch.Tensor,
         target_kv: torch.Tensor = None,
     ) -> Dict[str, torch.Tensor]:
         """
         hidden_states: (B, 256, 4096) float32
         reuse_kv:      (B, 32, 2, 32, 256, 128) bfloat16
+        stable_mask:   (B, 256) bool
         target_kv:     (B, 32, 2, 32, 256, 128) bfloat16 (optional)
         """
         # Shared encoding (computed once, reused for all layers)
-        hidden_embed = self.hidden_encoder(hidden_states)  # (B, 256, embed_dim)
+        hidden_embed = self.hidden_encoder(hidden_states, stable_mask)  # (B, 256, embed_dim)
 
         # Per-layer prediction
         pred_kv_list = []
@@ -204,7 +213,24 @@ class KVCacheModel(nn.Module):
 
         result = {"pred_kv": pred_kv}
         if target_kv is not None:
-            loss = F.mse_loss(pred_kv, target_kv.float())
+            # Masked loss: only compute on stable patch positions
+            # stable_mask: (B, 256) -> (B, 1, 1, 1, 256, 1) for broadcasting
+            mask = stable_mask.unsqueeze(1).unsqueeze(1).unsqueeze(1).unsqueeze(-1)
+            # mask shape: (B, 1, 1, 1, 256, 1) broadcasts to (B, 32, 2, 32, 256, 128)
+
+            pred_float = pred_kv
+            target_float = target_kv.float()
+
+            # Compute masked MSE: sum of squared errors on stable patches / count
+            diff_sq = (pred_float - target_float) ** 2
+            masked_diff_sq = diff_sq * mask.float()
+
+            # Count valid elements
+            num_stable = stable_mask.sum().float().clamp(min=1.0)
+            # Total elements per stable patch: 32 layers * 2 kv * 32 heads * 128 dim
+            elements_per_patch = self.num_layers * 2 * 32 * 128
+            loss = masked_diff_sq.sum() / (num_stable * elements_per_patch)
+
             result["loss"] = loss
         return result
 

@@ -1,6 +1,6 @@
 """
 Dataset for KV Cache Ghost Training v5
-Input: hidden_states.pt + kv_cache_reuse.pt → kv_cache_no_reuse.pt
+Input: hidden_states.pt + kv_cache_reuse.pt + stable_patches.json → kv_cache_no_reuse.pt
 Strategy: on-demand disk loading + aggressive worker parallelism.
 
 ~15TB data, cannot fit in RAM.
@@ -8,6 +8,7 @@ Use 16 workers/GPU × 8 GPUs = 128 parallel loaders,
 with prefetch_factor=4 to keep GPU pipeline full.
 """
 import os
+import json
 import torch
 from torch.utils.data import Dataset, DataLoader, DistributedSampler
 from pathlib import Path
@@ -52,7 +53,8 @@ class KVCacheDataset(Dataset):
                     h = step_dir / "hidden_states.pt"
                     r = step_dir / "kv_cache_reuse.pt"
                     n = step_dir / "kv_cache_no_reuse.pt"
-                    if h.exists() and r.exists() and n.exists():
+                    sp = step_dir / "stable_patches.json"
+                    if h.exists() and r.exists() and n.exists() and sp.exists():
                         self.step_paths.append(str(step_dir))
 
     def __len__(self) -> int:
@@ -61,6 +63,14 @@ class KVCacheDataset(Dataset):
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         step_path = self.step_paths[idx]
         s, e = self.kv_seq_start, self.kv_seq_end
+
+        # ---- Load stable_patches mask ----
+        with open(os.path.join(step_path, "stable_patches.json"), "r") as f:
+            sp_data = json.load(f)
+        stable_indices = sp_data["stable_patches"]  # list of ints in [0, 255]
+        # Create boolean mask: (256,)
+        stable_mask = torch.zeros(256, dtype=torch.bool)
+        stable_mask[stable_indices] = True
 
         # ---- Load hidden_states (float32) ----
         hs_data = torch.load(
@@ -103,6 +113,7 @@ class KVCacheDataset(Dataset):
             "hidden_states": hidden_states,  # (256, 4096) float32
             "reuse_kv": reuse_kv,            # (32, 2, 32, 256, 128) bfloat16
             "target_kv": target_kv,          # (32, 2, 32, 256, 128) bfloat16
+            "stable_mask": stable_mask,      # (256,) bool
         }
 
 
