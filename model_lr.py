@@ -1,11 +1,13 @@
 """
-Model for KV Cache Prediction v5
-Key design:
-  - Per-layer INDEPENDENT models (no weight sharing) for maximum accuracy
-  - HiddenStateEncoder replaces PatchEncoder (CNN → Linear)
-  - stable_patches mask as input feature + masked loss
-  - LayerNorm throughout + proper weight initialization
+Model for KV Cache Prediction — Scheme 3: Low-Rank Decomposition
+Key changes vs v5:
+  - The largest linear layer Linear(1024, 8192) is replaced by
+    low-rank factorization: Linear(1024, r) → Linear(r, 8192)
+  - Per-layer INDEPENDENT models are kept (no weight sharing)
   - Residual learning: pred = reuse + delta
+
+With hidden_dim=512, rank=32, expected params: ~40M  (vs 325M original)
+With hidden_dim=512, rank=16, expected params: ~30M
 """
 import math
 import torch
@@ -46,16 +48,32 @@ class HiddenStateEncoder(nn.Module):
         return self.encoder(hidden_states)
 
 
-class PerLayerKVPredictor(nn.Module):
+class LowRankLinear(nn.Module):
+    """
+    Low-rank linear layer: W ≈ A @ B
+    A: (in_features, rank), B: (rank, out_features)
+    Params: in_features * rank + rank * out_features  (vs in_features * out_features)
+    """
+
+    def __init__(self, in_features: int, out_features: int, rank: int, bias: bool = True):
+        super().__init__()
+        self.down = nn.Linear(in_features, rank, bias=False)
+        self.up = nn.Linear(rank, out_features, bias=bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.up(self.down(x))
+
+
+class PerLayerKVPredictorLR(nn.Module):
     """
     Independent KV delta predictor for a single transformer layer.
-    Each layer has its own reuse projector and delta MLP.
+    Uses low-rank decomposition on the output layer to reduce parameters.
 
     Flow:
     1. Mean-pool reuse_kv across heads → (B, 2, 256, 128) → flatten → (B, 256, 256)
     2. Project reuse features → (B, 256, reuse_proj_dim)
     3. Concat [hidden_embed, reuse_proj] → fused
-    4. MLP → delta (B, 256, 2*32*128)
+    4. MLP with low-rank output → delta (B, 256, 2*32*128)
     5. pred = reuse + delta (residual)
     """
 
@@ -65,7 +83,8 @@ class PerLayerKVPredictor(nn.Module):
         kv_dim: int = 128,
         embed_dim: int = 256,
         reuse_proj_dim: int = 256,
-        hidden_dim: int = 1024,
+        hidden_dim: int = 512,
+        output_rank: int = 32,
     ):
         super().__init__()
         self.num_heads = num_heads
@@ -79,7 +98,7 @@ class PerLayerKVPredictor(nn.Module):
             nn.GELU(),
         )
 
-        # Delta MLP: fused features → delta KV
+        # Delta MLP with low-rank output layer
         fused_dim = embed_dim + reuse_proj_dim
         self.delta_mlp = nn.Sequential(
             nn.Linear(fused_dim, hidden_dim),
@@ -88,23 +107,22 @@ class PerLayerKVPredictor(nn.Module):
             nn.Linear(hidden_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.GELU(),
-            nn.Linear(hidden_dim, self.output_dim),
         )
+        # Low-rank output: Linear(hidden_dim, rank) → Linear(rank, output_dim)
+        self.output_head = LowRankLinear(hidden_dim, self.output_dim, rank=output_rank)
 
         self._init_weights()
 
     def _init_weights(self):
         for m in self.modules():
             if isinstance(m, nn.Linear):
-                # Kaiming init for GELU-activated layers
                 nn.init.kaiming_normal_(m.weight, a=0, mode="fan_in", nonlinearity="linear")
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
-        # Last layer: small std for stable residual learning start
-        last_linear = self.delta_mlp[-1]
-        nn.init.normal_(last_linear.weight, mean=0.0, std=0.01)
-        nn.init.zeros_(last_linear.bias)
+        # Low-rank output: small init for stable residual start
+        nn.init.normal_(self.output_head.up.weight, mean=0.0, std=0.01)
+        nn.init.zeros_(self.output_head.up.bias)
 
     def forward(
         self,
@@ -130,8 +148,9 @@ class PerLayerKVPredictor(nn.Module):
         # Fuse: [hidden_embed, reuse_proj]
         fused = torch.cat([hidden_embed, reuse_proj], dim=-1)
 
-        # Predict delta
-        delta = self.delta_mlp(fused)                 # (B, 256, 8192)
+        # MLP body → low-rank output
+        h = self.delta_mlp(fused)                     # (B, 256, hidden_dim)
+        delta = self.output_head(h)                   # (B, 256, 8192)
 
         # Reshape: (B, 256, 2, 32, 128) → (B, 2, 32, 256, 128)
         delta = delta.reshape(B, 256, 2, self.num_heads, self.kv_dim)
@@ -142,10 +161,11 @@ class PerLayerKVPredictor(nn.Module):
         return pred
 
 
-class KVCacheModel(nn.Module):
+class KVCacheModelLR(nn.Module):
     """
-    Full model: HiddenStateEncoder + 32 independent PerLayerKVPredictors.
-    Each layer has its own parameters for maximum accuracy.
+    Low-Rank model: HiddenStateEncoder + 32 independent PerLayerKVPredictorLR.
+    Each layer has its own parameters, but the output projection uses low-rank
+    decomposition to significantly reduce parameter count.
     """
 
     def __init__(
@@ -156,7 +176,8 @@ class KVCacheModel(nn.Module):
         hidden_state_dim: int = 4096,
         embed_dim: int = 256,
         reuse_proj_dim: int = 256,
-        hidden_dim: int = 1024,
+        hidden_dim: int = 512,
+        output_rank: int = 32,
     ):
         super().__init__()
         self.num_layers = num_layers
@@ -168,14 +189,15 @@ class KVCacheModel(nn.Module):
             embed_dim=embed_dim,
         )
 
-        # Per-layer INDEPENDENT predictors (no weight sharing)
+        # Per-layer INDEPENDENT low-rank predictors
         self.layer_predictors = nn.ModuleList([
-            PerLayerKVPredictor(
+            PerLayerKVPredictorLR(
                 num_heads=num_heads,
                 kv_dim=kv_dim,
                 embed_dim=embed_dim,
                 reuse_proj_dim=reuse_proj_dim,
                 hidden_dim=hidden_dim,
+                output_rank=output_rank,
             )
             for _ in range(num_layers)
         ])
@@ -208,20 +230,15 @@ class KVCacheModel(nn.Module):
         result = {"pred_kv": pred_kv}
         if target_kv is not None:
             # Masked loss: only compute on stable patch positions
-            # stable_mask: (B, 256) -> (B, 1, 1, 1, 256, 1) for broadcasting
             mask = stable_mask.unsqueeze(1).unsqueeze(1).unsqueeze(1).unsqueeze(-1)
-            # mask shape: (B, 1, 1, 1, 256, 1) broadcasts to (B, 32, 2, 32, 256, 128)
 
             pred_float = pred_kv
             target_float = target_kv.float()
 
-            # Compute masked MSE: sum of squared errors on stable patches / count
             diff_sq = (pred_float - target_float) ** 2
             masked_diff_sq = diff_sq * mask.float()
 
-            # Count valid elements
             num_stable = stable_mask.sum().float().clamp(min=1.0)
-            # Total elements per stable patch: 32 layers * 2 kv * 32 heads * 128 dim
             elements_per_patch = self.num_layers * 2 * 32 * 128
             loss = masked_diff_sq.sum() / (num_stable * elements_per_patch)
 

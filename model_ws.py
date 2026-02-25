@@ -1,11 +1,12 @@
 """
-Model for KV Cache Prediction v5
-Key design:
-  - Per-layer INDEPENDENT models (no weight sharing) for maximum accuracy
-  - HiddenStateEncoder replaces PatchEncoder (CNN → Linear)
-  - stable_patches mask as input feature + masked loss
-  - LayerNorm throughout + proper weight initialization
+Model for KV Cache Prediction — Scheme 1: Weight Sharing
+Key changes vs v5:
+  - 32 PerLayerKVPredictors share ONE set of weights
+  - A learnable layer_embedding(32, embed_dim) distinguishes layers
+  - HiddenStateEncoder is unchanged (shared)
   - Residual learning: pred = reuse + delta
+
+Expected params: ~14.5M  (vs 325M original)
 """
 import math
 import torch
@@ -46,21 +47,22 @@ class HiddenStateEncoder(nn.Module):
         return self.encoder(hidden_states)
 
 
-class PerLayerKVPredictor(nn.Module):
+class SharedKVPredictor(nn.Module):
     """
-    Independent KV delta predictor for a single transformer layer.
-    Each layer has its own reuse projector and delta MLP.
+    Shared KV delta predictor for ALL transformer layers.
+    A layer_embedding is added to the fused features to distinguish layers.
 
     Flow:
     1. Mean-pool reuse_kv across heads → (B, 2, 256, 128) → flatten → (B, 256, 256)
     2. Project reuse features → (B, 256, reuse_proj_dim)
-    3. Concat [hidden_embed, reuse_proj] → fused
+    3. Concat [hidden_embed, reuse_proj, layer_embed] → fused
     4. MLP → delta (B, 256, 2*32*128)
     5. pred = reuse + delta (residual)
     """
 
     def __init__(
         self,
+        num_layers: int = 32,
         num_heads: int = 32,
         kv_dim: int = 128,
         embed_dim: int = 256,
@@ -72,6 +74,9 @@ class PerLayerKVPredictor(nn.Module):
         self.kv_dim = kv_dim
         self.output_dim = 2 * num_heads * kv_dim  # 8192
 
+        # Learnable layer embedding to distinguish layers
+        self.layer_embedding = nn.Embedding(num_layers, embed_dim)
+
         # Reuse KV projector: (B, 256, 2*128) → (B, 256, reuse_proj_dim)
         self.reuse_proj = nn.Sequential(
             nn.Linear(2 * kv_dim, reuse_proj_dim),
@@ -80,7 +85,8 @@ class PerLayerKVPredictor(nn.Module):
         )
 
         # Delta MLP: fused features → delta KV
-        fused_dim = embed_dim + reuse_proj_dim
+        # Input = hidden_embed + reuse_proj + layer_embed
+        fused_dim = embed_dim + reuse_proj_dim + embed_dim
         self.delta_mlp = nn.Sequential(
             nn.Linear(fused_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
@@ -96,7 +102,6 @@ class PerLayerKVPredictor(nn.Module):
     def _init_weights(self):
         for m in self.modules():
             if isinstance(m, nn.Linear):
-                # Kaiming init for GELU-activated layers
                 nn.init.kaiming_normal_(m.weight, a=0, mode="fan_in", nonlinearity="linear")
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
@@ -106,14 +111,19 @@ class PerLayerKVPredictor(nn.Module):
         nn.init.normal_(last_linear.weight, mean=0.0, std=0.01)
         nn.init.zeros_(last_linear.bias)
 
+        # Layer embedding: small init
+        nn.init.normal_(self.layer_embedding.weight, mean=0.0, std=0.02)
+
     def forward(
         self,
         hidden_embed: torch.Tensor,
         reuse_layer: torch.Tensor,
+        layer_idx: int,
     ) -> torch.Tensor:
         """
         hidden_embed: (B, 256, embed_dim) — shared hidden state encoding
         reuse_layer:  (B, 2, 32, 256, 128) — reuse KV for this layer
+        layer_idx:    int — which layer (0-31)
         returns:      (B, 2, 32, 256, 128) — predicted KV for this layer
         """
         B = hidden_embed.shape[0]
@@ -127,8 +137,14 @@ class PerLayerKVPredictor(nn.Module):
         # Project reuse features
         reuse_proj = self.reuse_proj(reuse_flat)      # (B, 256, reuse_proj_dim)
 
-        # Fuse: [hidden_embed, reuse_proj]
-        fused = torch.cat([hidden_embed, reuse_proj], dim=-1)
+        # Layer embedding: (embed_dim,) → (1, 1, embed_dim) → broadcast to (B, 256, embed_dim)
+        layer_emb = self.layer_embedding(
+            torch.tensor(layer_idx, device=hidden_embed.device)
+        )
+        layer_emb = layer_emb.unsqueeze(0).unsqueeze(0).expand(B, 256, -1)
+
+        # Fuse: [hidden_embed, reuse_proj, layer_emb]
+        fused = torch.cat([hidden_embed, reuse_proj, layer_emb], dim=-1)
 
         # Predict delta
         delta = self.delta_mlp(fused)                 # (B, 256, 8192)
@@ -142,10 +158,10 @@ class PerLayerKVPredictor(nn.Module):
         return pred
 
 
-class KVCacheModel(nn.Module):
+class KVCacheModelWS(nn.Module):
     """
-    Full model: HiddenStateEncoder + 32 independent PerLayerKVPredictors.
-    Each layer has its own parameters for maximum accuracy.
+    Weight-Sharing model: HiddenStateEncoder + 1 SharedKVPredictor.
+    All 32 layers share the same predictor, distinguished by layer_embedding.
     """
 
     def __init__(
@@ -168,17 +184,15 @@ class KVCacheModel(nn.Module):
             embed_dim=embed_dim,
         )
 
-        # Per-layer INDEPENDENT predictors (no weight sharing)
-        self.layer_predictors = nn.ModuleList([
-            PerLayerKVPredictor(
-                num_heads=num_heads,
-                kv_dim=kv_dim,
-                embed_dim=embed_dim,
-                reuse_proj_dim=reuse_proj_dim,
-                hidden_dim=hidden_dim,
-            )
-            for _ in range(num_layers)
-        ])
+        # Single shared predictor for all layers
+        self.shared_predictor = SharedKVPredictor(
+            num_layers=num_layers,
+            num_heads=num_heads,
+            kv_dim=kv_dim,
+            embed_dim=embed_dim,
+            reuse_proj_dim=reuse_proj_dim,
+            hidden_dim=hidden_dim,
+        )
 
     def forward(
         self,
@@ -196,11 +210,11 @@ class KVCacheModel(nn.Module):
         # Shared encoding (computed once, reused for all layers)
         hidden_embed = self.hidden_encoder(hidden_states)  # (B, 256, embed_dim)
 
-        # Per-layer prediction
+        # Per-layer prediction using shared predictor
         pred_kv_list = []
         for layer_idx in range(self.num_layers):
             reuse_layer = reuse_kv[:, layer_idx]           # (B, 2, 32, 256, 128)
-            pred_layer = self.layer_predictors[layer_idx](hidden_embed, reuse_layer)
+            pred_layer = self.shared_predictor(hidden_embed, reuse_layer, layer_idx)
             pred_kv_list.append(pred_layer)
 
         pred_kv = torch.stack(pred_kv_list, dim=1)         # (B, 32, 2, 32, 256, 128)
@@ -208,20 +222,15 @@ class KVCacheModel(nn.Module):
         result = {"pred_kv": pred_kv}
         if target_kv is not None:
             # Masked loss: only compute on stable patch positions
-            # stable_mask: (B, 256) -> (B, 1, 1, 1, 256, 1) for broadcasting
             mask = stable_mask.unsqueeze(1).unsqueeze(1).unsqueeze(1).unsqueeze(-1)
-            # mask shape: (B, 1, 1, 1, 256, 1) broadcasts to (B, 32, 2, 32, 256, 128)
 
             pred_float = pred_kv
             target_float = target_kv.float()
 
-            # Compute masked MSE: sum of squared errors on stable patches / count
             diff_sq = (pred_float - target_float) ** 2
             masked_diff_sq = diff_sq * mask.float()
 
-            # Count valid elements
             num_stable = stable_mask.sum().float().clamp(min=1.0)
-            # Total elements per stable patch: 32 layers * 2 kv * 32 heads * 128 dim
             elements_per_patch = self.num_layers * 2 * 32 * 128
             loss = masked_diff_sq.sum() / (num_stable * elements_per_patch)
 
